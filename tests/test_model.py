@@ -55,6 +55,13 @@ class ModelTests(unittest.TestCase):
         self.assertIs(first.parent, raw)
         self.assertIs(session.active, first)
         self.assertEqual(first.name, "raw_BaselineCorrected_1")
+        baseline = session.last_baseline
+        self.assertIsNotNone(baseline)
+        self.assertIs(baseline.parent, raw)
+        self.assertFalse(baseline.visible)
+        self.assertEqual(baseline.name, "raw_Baseline_1")
+        assert_allclose(baseline.y, [4, 3, 2, 1, 0])
+        self.assertEqual(session.spectra, [raw, first, baseline])
         self.assertEqual(session.anchors, [])
         assert_allclose(first.y, [0, 4, 2, 2, 0])
         assert_array_equal(raw.y, original)
@@ -67,6 +74,7 @@ class ModelTests(unittest.TestCase):
         second = session.apply()
         self.assertIs(second.parent, first)
         self.assertEqual(second.name, "raw_BaselineCorrected_2")
+        self.assertEqual(session.spectra, [raw, first, second, session.last_baseline, baseline])
         self.assertAlmostEqual(np.min(second.displayed_y), np.max(first.displayed_y))
         old_second_shift = second.shift
         first.offset = 14
@@ -75,6 +83,17 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(second.shift, first.shift)
         first.offset = -3.5
         self.assertEqual(first.shift, -3.5)
+
+    def test_apply_can_omit_retained_baseline(self):
+        session = SpectraSession()
+        raw = example()
+        session.add(raw)
+        session.add_anchor(0, 0)
+        session.add_anchor(4, 0)
+        corrected = session.apply(retain_baseline=False)
+        self.assertIs(session.active, corrected)
+        self.assertIsNone(session.last_baseline)
+        self.assertEqual(session.spectra, [raw, corrected])
 
     def test_anchor_validation(self):
         session = SpectraSession()

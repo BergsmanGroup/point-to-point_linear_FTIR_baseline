@@ -72,6 +72,7 @@ class GuiTests(unittest.TestCase):
             self.window.update()
 
     def correct(self):
+        self.app.retain_baseline.set(True)
         self.app.session.add_anchor(0, 0)
         self.app.session.add_anchor(4, 0)
         self.app.apply()
@@ -94,6 +95,14 @@ class GuiTests(unittest.TestCase):
         child = self.correct()
         self.assertIs(child.parent, raw)
         self.assertTrue(child.visible)
+        baseline = self.app.session.last_baseline
+        self.assertIsNotNone(baseline)
+        self.assertFalse(baseline.visible)
+        self.assertEqual(
+            self.app.table.get_children(),
+            (self.app._row_for(raw), self.app._row_for(child), self.app._row_for(baseline)),
+        )
+        self.assertEqual(self.app.table.set(self.app._row_for(baseline), "shown"), "\u2610")
         self.assertEqual(self.app.table.selection(), (self.app._row_for(child),))
         self.assertEqual(self.app.lines[child].get_linewidth(), 2.8)
         self.assertIsNotNone(self.app.flash_job)
@@ -108,6 +117,70 @@ class GuiTests(unittest.TestCase):
         # A free anchor on a displayed corrected spectrum must remove its shift.
         self.click_plot(2.0, float(child.displayed_y[2]), key="shift")
         assert_allclose(self.app.session.anchors[0], [2, child.y[2]], atol=1e-10)
+
+    def test_apply_default_does_not_retain_baseline(self):
+        self.app.session.add_anchor(0, 0)
+        self.app.session.add_anchor(4, 0)
+        self.app.apply()
+        self.assertEqual(len(self.app.session.spectra), 2)
+        self.assertIsNone(self.app.session.last_baseline)
+
+    def test_move_active_and_plot_style_follow_table_order(self):
+        raw = self.app.session.active
+        child = self.correct()
+        baseline = self.app.session.last_baseline
+        self.assertIsNotNone(baseline)
+        self.assertEqual(self.app.session.spectra, [raw, child, baseline])
+        self.assertEqual(self.app.lines[raw].get_color(), "#1f77b4")
+        self.assertEqual(self.app.lines[child].get_color(), "#ff7f0e")
+        self.assertEqual(self.app.lines[baseline].get_color(), "#2ca02c")
+        self.assertLess(self.app.lines[raw].get_zorder(), self.app.lines[child].get_zorder())
+        self.app.move_active(1)
+        self.assertEqual(self.app.session.spectra, [raw, baseline, child])
+        self.assertEqual(
+            self.app.table.get_children(),
+            tuple(self.app._row_for(spectrum) for spectrum in [raw, baseline, child]),
+        )
+        self.assertEqual(self.app.lines[baseline].get_color(), "#ff7f0e")
+        self.assertEqual(self.app.lines[child].get_color(), "#2ca02c")
+        self.assertGreater(self.app.lines[child].get_zorder(), self.app.lines[baseline].get_zorder())
+        self.app.palette.set("Colorblind")
+        self.app._refresh()
+        self.assertEqual(self.app.lines[raw].get_color(), "#0072B2")
+        self.app._finish_flash()
+        self.app.line_weight.set("2.5")
+        self.app.change_line_weight()
+        self.assertEqual(self.app.lines[child].get_linewidth(), 2.5)
+        with patch.object(self.app, "_refresh") as refresh:
+            self.app.line_weight.set("2.5")
+            self.app.change_line_weight()
+        refresh.assert_not_called()
+
+    def test_palette_picker_shows_swatch_rows(self):
+        self.app._show_palette_menu()
+        self.window.update()
+        popup = self.app.palette_popup
+        self.assertIsNotNone(popup)
+        self.assertEqual(len(popup.winfo_children()), 5)
+        self.assertLess(
+            popup.winfo_rooty(),
+            self.app.palette_menu.winfo_rooty(),
+        )
+        self.app._select_palette("Colorblind", popup)
+        self.assertEqual(self.app.palette.get(), "Colorblind")
+        self.assertEqual(self.app.palette_menu["text"], "Colorblind")
+
+    def test_rename_targets_active_spectrum_when_checked_state_differs(self):
+        raw = self.app.session.active
+        child = self.correct()
+        self.app._finish_flash()
+        self.click_row(raw, checkbox=True)
+        self.assertIs(self.app.session.active, child)
+        self.assertEqual(str(self.app.rename_button["state"]), "normal")
+        with patch("ftir_gui.simpledialog.askstring", return_value="active-renamed"):
+            self.app.rename()
+        self.assertEqual(child.name, "active-renamed")
+        self.assertEqual(raw.name, "raw")
 
     def test_visible_activation_prompt_cancel_accept_and_hold(self):
         raw = self.app.session.active
@@ -180,12 +253,17 @@ class GuiTests(unittest.TestCase):
         self.app.toggle_all()
         self.assertTrue(all(s.visible for s in self.app.session.spectra))
         self.assertIs(self.app.session.active, child)
-        self.assertEqual(str(self.app.rename_button["state"]), "disabled")
+        self.assertEqual(str(self.app.rename_button["state"]), "normal")
         self.app.master.set(False)
         self.app.toggle_all()
         self.assertTrue(all(not s.visible for s in self.app.session.spectra))
         self.assertEqual(str(self.app.save_button["state"]), "disabled")
         self.assertIs(self.app.session.active, child)
+        self.assertEqual(self.app.table.selection(), ())
+        self.assertEqual(str(self.app.rename_button["state"]), "normal")
+        self.click_row(child, checkbox=True)
+        self.assertIs(self.app.session.active, child)
+        self.assertEqual(self.app.table.selection(), (self.app._row_for(child),))
 
     def test_show_anchor_points_for_checked_spectra(self):
         raw = self.app.session.active
@@ -262,6 +340,8 @@ class GuiTests(unittest.TestCase):
             self.assertTrue(self.app.toolbar.mode)
             self.app.add_points_button.invoke()
             self.assertTrue(self.app.add_points.get())
+            self.assertFalse(self.app.retain_baseline.get())
+            self.assertEqual(self.app.rename_button["text"], "Rename active spectrum...")
             self.assertFalse(self.app.toolbar.mode)
             self.plot_event("button_press_event", 2, 2)
             self.assertIsNotNone(self.app.drag_point)

@@ -65,9 +65,18 @@ increasing or strictly decreasing. Spectragryph exports such as
 4. Use the pencil button in the Matplotlib toolbar; it is enabled by default.
 5. Drag with the left mouse button to place points snapped to the spectrum.
    Hold **Shift** while dragging to place a point at the cursor's X and Y.
-6. Add at least two points and click **Apply**.
+6. Add at least two points and click **Apply**. The corrected spectrum is
+   inserted directly below its parent. Check **Retain baseline spectrum**
+   before applying if you also want the calculated piecewise-linear baseline
+   added as a separate, unchecked spectrum.
 7. Use **Save spectra** to export selected spectra, choosing whether to
-   include the cumulative display offset.
+   include the cumulative display offset. Check the baseline spectrum first if
+   you want to save or display it.
+
+Use the **Move active up/down** buttons below the spectrum table to control
+table order. This order controls plot layering and color assignment. The
+toolbar also provides palette choices, including a colorblind-friendly
+palette, and a line-weight control.
 
 Right-clicking the plot removes the most recently added baseline point.
 **Clear anchors** removes the current unfinished baseline and **Apply

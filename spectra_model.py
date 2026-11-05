@@ -123,6 +123,7 @@ class SpectraSession:
     active: Spectrum | None = None
     anchors: list[tuple[float, float]] = field(default_factory=list)
     correction_count: int = 0
+    last_baseline: Spectrum | None = None
 
     def add(self, spectrum: Spectrum) -> None:
         self.spectra.append(spectrum)
@@ -152,12 +153,21 @@ class SpectraSession:
         self.anchors.append(point)
         return point
 
-    def apply(self) -> Spectrum:
+    def apply(self, retain_baseline: bool = True) -> Spectrum:
         parent = self.active
         if parent is None:
             raise ValueError("Open and activate a spectrum first.")
         baseline = linear_baseline(parent.x, self.anchors)
         self.correction_count += 1
+        baseline_spectrum = Spectrum(
+            name=f"{parent.source.stem}_Baseline_{self.correction_count}",
+            x=parent.x.copy(),
+            y=baseline,
+            source=parent.source,
+            parent=parent,
+            visible=False,
+            anchors=tuple(self.anchors),
+        )
         spectrum = Spectrum(
             name=f"{parent.source.stem}_BaselineCorrected_{self.correction_count}",
             x=parent.x.copy(),
@@ -167,7 +177,13 @@ class SpectraSession:
             offset=round(float(np.max(parent.y) - np.min(parent.y - baseline)), 1),
             anchors=tuple(self.anchors),
         )
-        self.add(spectrum)
+        insert_at = self.spectra.index(parent) + 1
+        self.spectra.insert(insert_at, spectrum)
+        if retain_baseline:
+            self.spectra.insert(insert_at + 1, baseline_spectrum)
+        self.active = spectrum
+        self.last_baseline = baseline_spectrum if retain_baseline else None
+        self.anchors.clear()
         return spectrum
 
 

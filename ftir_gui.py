@@ -12,10 +12,31 @@ from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 import numpy as np
 from matplotlib.backend_bases import MouseButton, MouseEvent
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
 from spectra_model import Spectrum, SpectraSession, linear_baseline, load_spectrum, save_spectrum
+
+
+PALETTES: dict[str, tuple[str, ...]] = {
+    "Tab10": (
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+    ),
+    "Colorblind": (
+        "#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7",
+        "#56B4E9", "#F0E442", "#000000",
+    ),
+    "Viridis": (
+        "#440154", "#482878", "#3e4989", "#31688e", "#26828e",
+        "#1f9e89", "#35b779", "#6ece58", "#b5de2b", "#fde725",
+    ),
+    "Grayscale": (
+        "#111111", "#333333", "#555555", "#777777", "#999999",
+        "#bbbbbb", "#dddddd",
+    ),
+}
 
 
 class ToolTip:
@@ -85,6 +106,11 @@ class BaselineApp:
         self.shift_held = False
         self.add_points = tk.BooleanVar(value=True)
         self.show_anchor_points = tk.BooleanVar(value=False)
+        self.retain_baseline = tk.BooleanVar(value=False)
+        self.palette = tk.StringVar(value="Tab10")
+        self.line_weight = tk.StringVar(value="1.0")
+        self.line_weight_value = 1.0
+        self.palette_popup: tk.Toplevel | None = None
         self.drag_free: bool | None = None
         self.drag_point: tuple[float, float] | None = None
         self.master = tk.BooleanVar(value=False)
@@ -152,7 +178,17 @@ class BaselineApp:
         self.table.bind("<KeyPress>", lambda event: "break")
         self.table.bind("<Double-Button-1>", self._double_row)
         self.table.bind("<<TreeviewSelect>>", lambda event: self._sync_controls())
-        self.rename_button = ttk.Button(sidebar, text="Rename checked spectrum...", command=self.rename)
+        order_buttons = ttk.Frame(sidebar)
+        order_buttons.pack(fill=tk.X, pady=(0, 3))
+        self.move_up_button = ttk.Button(
+            order_buttons, text="▲ Move active up", command=lambda: self.move_active(-1)
+        )
+        self.move_up_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        self.move_down_button = ttk.Button(
+            order_buttons, text="▼ Move active down", command=lambda: self.move_active(1)
+        )
+        self.move_down_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        self.rename_button = ttk.Button(sidebar, text="Rename active spectrum...", command=self.rename)
         self.rename_button.pack(fill=tk.X, pady=2)
         ttk.Label(
             sidebar,
@@ -187,6 +223,23 @@ class BaselineApp:
         )
         self.apply_button = ttk.Button(self.toolbar, text="Apply baseline", command=self.apply)
         self.apply_button.pack(side=tk.LEFT, padx=2)
+        self.retain_baseline_button = ttk.Checkbutton(
+            self.toolbar, text="Retain baseline spectrum", variable=self.retain_baseline
+        )
+        self.retain_baseline_button.pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(self.toolbar, text="Palette:").pack(side=tk.LEFT, padx=(2, 2))
+        self.palette_menu = ttk.Button(
+            self.toolbar, text=self.palette.get(), command=self._show_palette_menu,
+        )
+        self.palette_menu.pack(side=tk.LEFT, padx=2)
+        ttk.Label(self.toolbar, text="Line weight:").pack(side=tk.LEFT, padx=(6, 2))
+        self.line_weight_spinner = ttk.Spinbox(
+            self.toolbar, from_=0.25, to=10.0, increment=0.25,
+            textvariable=self.line_weight, width=5, command=self.change_line_weight,
+        )
+        self.line_weight_spinner.pack(side=tk.LEFT, padx=2)
+        self.line_weight_spinner.bind("<Return>", self.change_line_weight)
+        self.line_weight_spinner.bind("<FocusOut>", self.change_line_weight)
         self.anchor_points_button = tk.Checkbutton(
             self.toolbar, text="Show anchors", variable=self.show_anchor_points,
             indicatoron=False, command=self._refresh, padx=6, pady=2,
@@ -286,10 +339,22 @@ class BaselineApp:
 
     def _sync_controls(self) -> None:
         checked = self.checked()
+        active = self.session.active
         for button in (self.delete_button, self.save_button, self.image_button):
             button.configure(state=tk.NORMAL if checked else tk.DISABLED)
-        self.rename_button.configure(state=tk.NORMAL if len(checked) == 1 else tk.DISABLED)
-        active = self.session.active
+        self.rename_button.configure(state=tk.NORMAL if active is not None else tk.DISABLED)
+        active_index = (
+            self.session.spectra.index(self.session.active)
+            if self.session.active in self.session.spectra else -1
+        )
+        self.move_up_button.configure(
+            state=tk.NORMAL if active_index > 0 else tk.DISABLED
+        )
+        self.move_down_button.configure(
+            state=tk.NORMAL
+            if 0 <= active_index < len(self.session.spectra) - 1
+            else tk.DISABLED
+        )
         self.spinner.configure(state=tk.NORMAL if active is not None else tk.DISABLED)
         self.clear_button.configure(state=tk.NORMAL if self.session.anchors else tk.DISABLED)
         self.apply_button.configure(
@@ -301,6 +366,9 @@ class BaselineApp:
         )
 
     def _select_active_row(self) -> None:
+        if not self.checked():
+            self.table.selection_remove(self.table.selection())
+            return
         active = self.preview or self.session.active
         if active is not None:
             row = self._row_for(active)
@@ -311,11 +379,28 @@ class BaselineApp:
 
     def _refresh(self, fit: bool = False) -> None:
         self._cancel_drag(redraw=False)
-        for spectrum, line in self.lines.items():
+        if self.palette_menu["text"] != self.palette.get():
+            self.palette_menu.configure(text=self.palette.get())
+        colors = PALETTES[self.palette.get()]
+        for index, spectrum in enumerate(self.session.spectra):
+            line = self.lines[spectrum]
+            color = colors[index % len(colors)]
+            if line.get_color() != color:
+                line.set_color(color)
             line.set_ydata(spectrum.displayed_y)
             line.set_visible(spectrum.visible or self.preview is spectrum)
-            line.set_linewidth(2.8 if self.pressed is spectrum else 1.0)
+            line_width = 2.8 if self.pressed is spectrum else self.line_weight_value
+            if line.get_linewidth() != line_width:
+                line.set_linewidth(line_width)
+            zorder = index + 2
+            if line.get_zorder() != zorder:
+                line.set_zorder(zorder)
             anchor_line = self.anchor_lines[spectrum]
+            if anchor_line.get_markeredgecolor() != to_rgba(color):
+                anchor_line.set_markeredgecolor(color)
+            anchor_zorder = index + 2.5
+            if anchor_line.get_zorder() != anchor_zorder:
+                anchor_line.set_zorder(anchor_zorder)
             anchor_x = [point[0] for point in spectrum.anchors]
             anchor_y = [
                 spectrum.displayed_y[spectrum.nearest_index(x)]
@@ -348,6 +433,55 @@ class BaselineApp:
         self._select_active_row()
         self._sync_controls()
         self.canvas.draw_idle()
+
+    def _show_palette_menu(self) -> None:
+        if self.palette_popup is not None:
+            self.palette_popup.destroy()
+        popup = tk.Toplevel(self.root)
+        self.palette_popup = popup
+        popup.title("Select palette")
+        popup.transient(self.root)
+        popup.resizable(False, False)
+        ttk.Label(popup, text="Select palette", padding=(8, 6)).pack(anchor=tk.W)
+        for name, colors in PALETTES.items():
+            row = ttk.Frame(popup, padding=(8, 3))
+            row.pack(fill=tk.X)
+            label = ttk.Label(row, text=name, width=14)
+            label.pack(side=tk.LEFT)
+            swatches = tk.Canvas(row, width=180, height=18, highlightthickness=0)
+            swatches.pack(side=tk.LEFT)
+            width = 180 / len(colors)
+            for index, color in enumerate(colors):
+                swatches.create_rectangle(
+                    index * width, 0, (index + 1) * width, 18,
+                    fill=color, outline=color,
+                )
+            for widget in (row, label, swatches):
+                widget.bind(
+                    "<Button-1>",
+                    lambda event, selected=name, window=popup: self._select_palette(
+                        selected, window
+                    ),
+                )
+        popup.bind("<Escape>", lambda event: self._close_palette_menu())
+        popup.update_idletasks()
+        x = self.palette_menu.winfo_rootx()
+        y = self.palette_menu.winfo_rooty() - popup.winfo_reqheight()
+        popup.geometry(f"+{x}+{y}")
+        popup.grab_set()
+
+    def _select_palette(self, name: str, popup: tk.Toplevel) -> None:
+        self.palette.set(name)
+        popup.grab_release()
+        popup.destroy()
+        self.palette_popup = None
+        self._refresh()
+
+    def _close_palette_menu(self) -> None:
+        if self.palette_popup is not None:
+            self.palette_popup.grab_release()
+            self.palette_popup.destroy()
+            self.palette_popup = None
 
     def _cache_blit_background(self, event: object | None = None) -> None:
         self._blit_background = self.canvas.copy_from_bbox(self.axes.bbox)
@@ -434,7 +568,7 @@ class BaselineApp:
         self.table.selection_set(row)
         self.table.focus(row)
         for item, line in self.lines.items():
-            line.set_linewidth(2.8 if item is spectrum else 1.0)
+            line.set_linewidth(2.8 if item is spectrum else self.line_weight_value)
 
     def _restore_active_highlight(self, spectrum: Spectrum | None) -> None:
         if spectrum is None:
@@ -453,7 +587,10 @@ class BaselineApp:
         spectrum = self.rows[row]
         if column == "#1":
             self._pending_row = None
+            had_checked = bool(self.checked())
             spectrum.visible = not spectrum.visible
+            if spectrum.visible and not had_checked and not self._activate(spectrum):
+                spectrum.visible = False
             self._refresh(fit=True)
             return "break"
         self._cancel_flash()
@@ -483,7 +620,7 @@ class BaselineApp:
                     self._refresh()
                     self.pressed = None
                     for line in self.lines.values():
-                        line.set_linewidth(1.0)
+                        line.set_linewidth(self.line_weight_value)
                     self.canvas.draw_idle()
                 else:
                     self._restore_active_highlight(previous)
@@ -500,7 +637,25 @@ class BaselineApp:
         visible = self.master.get()
         for spectrum in self.session.spectra:
             spectrum.visible = visible
+        if visible and self.session.active is None and self.session.spectra:
+            self.session.active = self.session.spectra[0]
         self._refresh(fit=True)
+
+    def move_active(self, direction: int) -> None:
+        active = self.session.active
+        if active is None or active not in self.session.spectra:
+            return
+        index = self.session.spectra.index(active)
+        target = index + direction
+        if not 0 <= target < len(self.session.spectra):
+            return
+        self.session.spectra[index], self.session.spectra[target] = (
+            self.session.spectra[target], self.session.spectra[index]
+        )
+        row = self._row_for(active)
+        self.table.move(row, "", target)
+        self._refresh()
+        self.table.see(row)
 
     def _shift_down(self, event: tk.Event) -> None:
         self.shift_held = True
@@ -638,11 +793,14 @@ class BaselineApp:
 
     def apply(self) -> None:
         try:
-            spectrum = self.session.apply()
+            spectrum = self.session.apply(retain_baseline=self.retain_baseline.get())
         except ValueError as error:
             messagebox.showerror("Cannot apply baseline", str(error), parent=self.root)
             return
         self._insert(spectrum)
+        baseline = self.session.last_baseline
+        if baseline is not None:
+            self._insert(baseline)
         self._cancel_flash()
         self.pressed = spectrum
         self.show_anchor_points.set(False)
@@ -655,15 +813,18 @@ class BaselineApp:
     def _finish_flash(self) -> None:
         self._cancel_flash()
         for line in self.lines.values():
-            line.set_linewidth(1.0)
+            line.set_linewidth(self.line_weight_value)
         self.canvas.draw_idle()
 
     def _insert(self, spectrum: Spectrum) -> None:
         self.row_count += 1
         row = f"spectrum-{self.row_count}"
         self.rows[row] = spectrum
-        self.table.insert("", tk.END, iid=row, values=("\u2611", spectrum.name))
-        (line,) = self.axes.plot(spectrum.x, spectrum.displayed_y, linewidth=1, label=spectrum.name)
+        shown = "\u2611" if spectrum.visible else "\u2610"
+        self.table.insert(
+            "", self.session.spectra.index(spectrum), iid=row, values=(shown, spectrum.name)
+        )
+        (line,) = self.axes.plot(spectrum.x, spectrum.displayed_y, label=spectrum.name)
         self.lines[spectrum] = line
         (anchor_line,) = self.axes.plot(
             [], [], linestyle="none", marker="o", markersize=6,
@@ -671,6 +832,24 @@ class BaselineApp:
             label="_anchor_points", zorder=12,
         )
         self.anchor_lines[spectrum] = anchor_line
+
+    def change_line_weight(self, event: tk.Event | None = None) -> None:
+        try:
+            value = float(self.line_weight.get())
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid line weight", "Enter a positive finite line weight.",
+                parent=self.root,
+            )
+            self.line_weight.set("1.0")
+            return
+        if value == self.line_weight_value:
+            return
+        self.line_weight_value = value
+        self.line_weight.set(f"{value:g}")
+        self._refresh()
 
     def change_offset(self, event: tk.Event | None = None) -> None:
         active = self.session.active
@@ -757,10 +936,9 @@ class BaselineApp:
         )
 
     def rename(self) -> None:
-        selected = self.checked()
-        if len(selected) != 1:
+        spectrum = self.session.active
+        if spectrum is None:
             return
-        spectrum = selected[0]
         name = simpledialog.askstring(
             "Rename spectrum", "Spectrum name:", initialvalue=spectrum.name, parent=self.root
         )
@@ -879,7 +1057,9 @@ class BaselineApp:
         for spectrum in selected:
             axes.plot(
                 spectrum.x, spectrum.displayed_y, label=spectrum.name,
-                color=self.lines[spectrum].get_color(), linewidth=1,
+                color=self.lines[spectrum].get_color(),
+                linewidth=self.line_weight_value,
+                zorder=self.session.spectra.index(spectrum) + 2,
             )
         axes.set_xlabel(self.axes.get_xlabel())
         axes.set_ylabel(self.axes.get_ylabel())

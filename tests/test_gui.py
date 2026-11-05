@@ -1,3 +1,4 @@
+import csv
 import tempfile
 import time
 import tkinter as tk
@@ -314,6 +315,13 @@ class GuiTests(unittest.TestCase):
         send("<ButtonRelease-1>", 3, 2)
         self.assertEqual(self.app.session.anchors, [(3, 7)])
         self.assertIsNone(self.app.drag_free)
+        send("<Motion>", 3, 7)
+        self.assertTrue(self.app.cursor_point.get_visible())
+        send("<ButtonPress-1>", 3, 7)
+        self.assertEqual(self.app.drag_anchor_index, 0)
+        send("<B1-Motion>", 1, 2, state=256)
+        send("<ButtonRelease-1>", 1, 2)
+        self.assertEqual(self.app.session.anchors, [(1, 3)])
         send("<ButtonPress-1>", 1.5, 2.5, state=1)
         self.assertTrue(self.app.drag_free)
         send("<B1-Motion>", 2.5, 3.5, state=257)
@@ -325,6 +333,13 @@ class GuiTests(unittest.TestCase):
         self.window.update()
         self.assertIsNone(self.app.drag_free)
         self.assertEqual(len(self.app.session.anchors), 2)
+        send("<ButtonPress-3>", 1, 3)
+        send("<ButtonRelease-3>", 1, 3)
+        self.assertEqual(len(self.app.session.anchors), 1)
+        self.assertAlmostEqual(self.app.session.anchors[0][0], 2.5, places=2)
+        send("<ButtonPress-3>", 3, 2)
+        send("<ButtonRelease-3>", 3, 2)
+        self.assertEqual(self.app.session.anchors, [])
 
     def test_toolbar_toggle_and_navigation_exclusion(self):
         self.app.add_points_button.invoke()
@@ -391,6 +406,89 @@ class GuiTests(unittest.TestCase):
         self.assertIsNotNone(self.app.drag_point)
         self.plot_event("button_release_event", 2.5, 10.5)
         assert_allclose(self.app.session.anchors, [(2.5, 10.5 - child.shift)])
+
+    def test_hover_move_and_delete_preserve_creation_history(self):
+        self.app.session.add_anchor(3, 0)
+        self.app.session.add_anchor(0, 0)
+        self.app.session.add_anchor(2, 0)
+        self.app._refresh()
+        self.plot_event("motion_notify_event", 3, 7)
+        self.assertTrue(self.app.cursor_point.get_visible())
+        assert_allclose(self.app.cursor_point.get_data(), [[3], [7]])
+        self.app.canvas.callbacks.process("figure_leave_event", object())
+        self.assertFalse(self.app.cursor_point.get_visible())
+        self.plot_event("motion_notify_event", 3, 2)
+        self.assertFalse(self.app.cursor_point.get_visible())
+        self.plot_event("button_press_event", 3, 7, key="shift")
+        self.assertEqual(self.app.drag_anchor_index, 0)
+        self.assertFalse(self.app.drag_free)
+        self.plot_event("motion_notify_event", 1, 1)
+        self.assertEqual(self.app.session.anchors, [(3, 7), (0, 0), (2, 4)])
+        assert_allclose(self.app.baseline_line.get_xdata(), [0, 1, 2])
+        assert_allclose(self.app.baseline_line.get_ydata(), [0, 3, 4])
+        self.plot_event("button_release_event", 1, 1)
+        self.assertEqual(self.app.session.anchors, [(1, 3), (0, 0), (2, 4)])
+        self.click_plot(3, 2, button=MouseButton.RIGHT)
+        self.assertEqual(self.app.session.anchors, [(1, 3), (0, 0)])
+        self.app.session.add_anchor(2, 0)
+        self.app.session.add_anchor(4, 0)
+        self.app._refresh()
+        self.click_plot(1, 3, button=MouseButton.RIGHT)
+        self.assertEqual(self.app.session.anchors, [(0, 0), (2, 4), (4, 4)])
+        assert_allclose(self.app.baseline_line.get_xdata(), [0, 2, 4])
+        self.click_plot(3, 2, button=MouseButton.RIGHT)
+        self.assertEqual(self.app.session.anchors, [(0, 0), (2, 4)])
+        self.click_plot(2, 4, button=MouseButton.RIGHT)
+        self.click_plot(0, 0, button=MouseButton.RIGHT)
+        self.assertEqual(self.app.session.anchors, [])
+        self.assertFalse(self.app.baseline_line.get_visible())
+
+    def test_move_anchor_cancel_collision_and_release_coordinates(self):
+        self.app.session.add_anchor(3, 0)
+        self.app.session.add_anchor(0, 0)
+        self.app._refresh()
+        original = self.app.session.anchors.copy()
+        self.plot_event("button_press_event", 3, 7)
+        self.plot_event("motion_notify_event", 0.1, 1)
+        self.assertIsNone(self.app.drag_point)
+        self.assertIn("already exists", self.app.status.get())
+        self.plot_event("button_release_event", 0.1, 1)
+        self.assertEqual(self.app.session.anchors, original)
+        self.plot_event("button_press_event", 3, 7)
+        self.plot_event("motion_notify_event", 2, 1)
+        self.app._cancel_drag()
+        self.plot_event("button_release_event", 2, 1)
+        self.assertEqual(self.app.session.anchors, original)
+        self.plot_event("button_press_event", 3, 7)
+        outside = MouseEvent(
+            "button_release_event", self.app.canvas, -10, -10, button=MouseButton.LEFT
+        )
+        self.app.canvas.callbacks.process("button_release_event", outside)
+        self.assertEqual(self.app.session.anchors, original)
+        self.plot_event("button_press_event", 3, 7)
+        self.plot_event("motion_notify_event", 2, 1)
+        self.plot_event("button_release_event", 1, 1)
+        self.assertEqual(self.app.session.anchors, [(1, 3), (0, 0)])
+
+    def test_move_free_anchor_on_offset_spectrum_and_noop_click(self):
+        child = self.correct()
+        self.app._finish_flash()
+        self.app.session.add_anchor(2.5, child.shift + 3.5, free=True)
+        self.app.session.add_anchor(0, 0)
+        self.app._refresh()
+        self.click_plot(2.5, child.shift + 3.5)
+        self.assertEqual(self.app.session.anchors[0], (2.5, 3.5))
+        self.plot_event("motion_notify_event", 2.5, child.shift + 3.5)
+        self.assertTrue(self.app.cursor_point.get_visible())
+        self.plot_event("button_press_event", 2.5, child.shift + 3.5)
+        self.plot_event("motion_notify_event", 3, child.shift + 1)
+        self.plot_event("button_release_event", 3, child.shift + 1)
+        self.assertEqual(self.app.session.anchors, [(3, child.y[1]), (0, 0)])
+        self.app.add_points_button.invoke()
+        self.plot_event("motion_notify_event", 3, child.displayed_y[1])
+        self.assertFalse(self.app.cursor_point.get_visible())
+        self.click_plot(3, child.displayed_y[1], button=MouseButton.RIGHT)
+        self.assertEqual(len(self.app.session.anchors), 2)
 
     def test_cancel_drag_and_duplicate_recovery(self):
         self.click_plot(2, 1)
@@ -525,7 +623,67 @@ class GuiTests(unittest.TestCase):
             self.window.after(30, choose)
             with patch.object(self.app, "_export_spectra") as export:
                 self.app.save_spectra()
-            export.assert_called_once_with(self.app.checked(), expected)
+            export.assert_called_once_with(self.app.checked(), expected, include_anchors=False)
+
+    def test_save_popup_anchor_option(self):
+        def choose():
+            for window in self.window.winfo_children():
+                if isinstance(window, tk.Toplevel):
+                    for widget in window.winfo_children():
+                        if widget.winfo_class() == "TCheckbutton":
+                            widget.invoke()
+                    for widget in window.winfo_children():
+                        if widget.winfo_class() == "TButton" and widget["text"] == "Save without offset":
+                            widget.invoke()
+                            return
+            self.fail("Save dialog option missing")
+
+        self.window.after(30, choose)
+        with patch.object(self.app, "_export_spectra") as export:
+            self.app.save_spectra()
+        export.assert_called_once_with(self.app.checked(), False, include_anchors=True)
+
+    def test_anchor_export_with_baseline_and_filename_collisions(self):
+        raw = self.app.session.active
+        child = self.correct()
+        self.app._finish_flash()
+        baseline = self.app.session.last_baseline
+        baseline.name = "result"
+        child.name = "result_Anchors"
+        raw.name = "result"
+        with patch("ftir_gui.filedialog.askdirectory", return_value=self.temp.name):
+            self.app._export_spectra([baseline, child, raw], True, include_anchors=True)
+        for filename, spectrum in [
+            ("result.csv", baseline), ("result_Anchors_2.csv", child), ("result_2.csv", raw),
+        ]:
+            assert_allclose(load_spectrum(Path(self.temp.name) / filename).y, spectrum.displayed_y)
+        for filename in ["result_Anchors.csv", "result_Anchors_2_Anchors.csv"]:
+            with (Path(self.temp.name) / filename).open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.reader(stream))
+            self.assertEqual([tuple(map(float, row)) for row in rows[1:]], list(baseline.anchors))
+        self.assertFalse((Path(self.temp.name) / "result_2_Anchors.csv").exists())
+
+    def test_anchor_export_overwrite_cancel_and_failure(self):
+        child = self.correct()
+        self.app._finish_flash()
+        output = Path(self.temp.name) / "saved.csv"
+        anchors = Path(self.temp.name) / "saved_Anchors.csv"
+        anchors.write_text("keep this", encoding="utf-8")
+        with patch("ftir_gui.filedialog.asksaveasfilename", return_value=str(output)), patch(
+            "ftir_gui.messagebox.askokcancel", return_value=False
+        ) as confirm:
+            self.app._export_spectra([child], False, include_anchors=True)
+        confirm.assert_called_once()
+        self.assertFalse(output.exists())
+        self.assertEqual(anchors.read_text(encoding="utf-8"), "keep this")
+        with patch("ftir_gui.filedialog.asksaveasfilename", return_value=str(output)), patch(
+            "ftir_gui.messagebox.askokcancel", return_value=True
+        ), patch("ftir_gui.save_anchors", side_effect=OSError("anchor write failed")), patch(
+            "ftir_gui.messagebox.showerror"
+        ) as error:
+            self.app._export_spectra([child], False, include_anchors=True)
+        self.assertIn("Saved 1 of 2", error.call_args.args[1])
+        self.assertIn("anchor write failed", error.call_args.args[1])
 
     def test_actual_sample_end_to_end(self):
         self.app.open_path(next(ROOT.glob("SID*.csv")))

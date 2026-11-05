@@ -1,3 +1,4 @@
+import csv
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +6,9 @@ from pathlib import Path
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 
-from spectra_model import Spectrum, SpectraSession, linear_baseline, load_spectrum, save_spectrum
+from spectra_model import (
+    Spectrum, SpectraSession, linear_baseline, load_spectrum, save_anchors, save_spectrum,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,6 +127,45 @@ class ModelTests(unittest.TestCase):
             assert_array_equal(loaded.y, spectrum.y)
             save_spectrum(spectrum, path, with_offset=True)
             assert_array_equal(load_spectrum(path).y, spectrum.displayed_y)
+
+    def test_move_anchor_preserves_creation_order_and_validates_duplicates(self):
+        session = SpectraSession()
+        session.add(example())
+        session.add_anchor(3, 0)
+        session.add_anchor(0, 0)
+        session.add_anchor(2, 0)
+        self.assertEqual(session.move_anchor(0, 1.1, 999), (1, 3))
+        self.assertEqual(session.anchors, [(1, 3), (0, 0), (2, 4)])
+        self.assertEqual(session.move_anchor(0, 1, 999), (1, 3))
+        before = session.anchors.copy()
+        for index, x, y in [(0, 2, 0), (0, 10, 0), (0, 1, np.nan), (-1, 1, 0), (3, 1, 0)]:
+            with self.subTest(index=index, x=x), self.assertRaises(ValueError):
+                session.move_anchor(index, x, y)
+            self.assertEqual(session.anchors, before)
+        self.assertEqual(session.anchors.pop(), (2, 4))
+
+    def test_save_anchors_preserves_exact_free_coordinates_and_creation_order(self):
+        session = SpectraSession()
+        session.add(example())
+        session.add_anchor(3.125678901234567, 5.123456789012345, free=True)
+        session.add_anchor(0.125678901234567, -0.123456789012345, free=True)
+        expected = tuple(session.anchors)
+        corrected = session.apply()
+        baseline = session.last_baseline
+        corrected.offset = 100
+        baseline.offset = -100
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "anchors.csv"
+            for spectrum in (corrected, baseline):
+                save_anchors(spectrum, path)
+                with path.open(newline="", encoding="utf-8") as stream:
+                    rows = list(csv.reader(stream))
+                self.assertIn("unshifted; parent: raw", rows[0][1])
+                self.assertEqual(tuple(tuple(map(float, row)) for row in rows[1:]), expected)
+            path.unlink()
+            with self.assertRaisesRegex(ValueError, "no saved correction anchors"):
+                save_anchors(example(), path)
+            self.assertFalse(path.exists())
 
     def test_loader_formats_and_errors(self):
         with tempfile.TemporaryDirectory() as directory:

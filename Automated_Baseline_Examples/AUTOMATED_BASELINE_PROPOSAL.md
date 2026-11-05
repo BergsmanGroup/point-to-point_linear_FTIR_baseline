@@ -1,5 +1,16 @@
 # Proposal: scale-controlled automatic point-to-point FTIR baselines
 
+> **Implementation update:** The original comparison and algorithm proposal
+> below are retained as a historical design record. The expanded reference
+> files replace the original pair, so the filenames and statistics in section 1
+> describe the earlier files, not the current ten drawings. The implemented
+> experimental backend uses local convex envelopes **only to guide selection
+> of actual measured anchors**, plus a revised integer mapping instead of
+> the flat morphological opening and `W=25*C` below. Every final anchor is
+> an exact measured X,Y pair; only straight segments connect them.
+> See [Implementation and first review](#5-implementation-and-first-review)
+> for the current method, outputs, and limitations.
+
 ## Scope and recommendation
 
 Automatically propose baseline anchors using a lower-envelope calculation with
@@ -278,3 +289,213 @@ No automatic method can reliably distinguish a broad chemical absorption
 from broad baseline curvature using shape alone. Coarseness makes that
 tradeoff explicit and reproducible; it does not eliminate the need to
 choose an appropriate scientific interpretation.
+
+## 5. Implementation and first review
+
+### Current scope
+
+The experimental backend is in [`automatic_baseline.py`](../automatic_baseline.py).
+It neither changes the GUI nor applies a correction to the session. It returns
+anchors, full baseline and corrected arrays, requested/effective scale, estimated
+noise, simplification tolerance, a boundary mask, warnings, and algorithm version
+`on-data-linear-anchors-v2`. The returned anchors are exact measured X,Y pairs,
+not envelope values. They are evaluated with the existing `linear_baseline`
+and can be used by the existing manual correction/session path. The earlier
+v1 output was technically a dense polyline, but its off-data envelope anchors
+made it appear smooth and did not meet the required on-data-anchor constraint.
+
+All five current originals have 6,950 samples. Fine/coarse originals are
+numerically identical for each pair. The ten baseline exports are reconstructed
+by their explicit anchors and satisfy `original - baseline = corrected`, with
+no export offset adjustment. The review script verifies these conditions rather
+than assuming them. Inputs and manual drawings are not modified.
+
+### Revised integer parameter
+
+The supported range is **integer C = 0 through 100**, including intentionally
+poor settings at either end:
+
+```text
+requested full window width W(C) = 5 * (2**(C/10) - 1) cm^-1
+```
+
+| C | Requested W, cm^-1 | Role in this review |
+|---:|---:|---|
+| 0 | 0 | Measured data polyline itself; removes essentially all signal |
+| 30 | 35 | Very fine local following |
+| 45 | 108.14 | Finer review candidate |
+| 55 | 221.27 | Intermediate review candidate |
+| 65 | 447.55 | Coarser review candidate |
+| 80 | 1275 | Deliberately very broad bridging |
+| 100 | 5115 | Deliberately excessive coarsening on these examples |
+
+This logarithmic spacing gives many integer settings in the useful transition
+range while retaining strong extremes. It does not merely interpolate between
+the two manual drawings or constrain the result to lie between them.
+Ten increments approximately double a nonzero large window width.
+The physical width is independent of sample density. If it is smaller than
+the median sample spacing, that spacing is used with a warning. A window radius
+at least as large as the measured span uses one global lower convex hull as
+the selection guide; its effective full width is capped at twice that span
+and reported. The final baseline still connects selected measured samples.
+
+### Implemented estimation and drawing
+
+1. Validate finite, matching, one-dimensional arrays with at least three samples
+   and unique monotonic X. Normalize direction for estimation; return arrays on
+   the original grid and in the original order. Ignore display offsets.
+2. Make an estimation-only signal using a 3 cm^-1 full-width local median.
+   First remove a local slope estimated by the median of neighboring slopes,
+   take the median residual, and restore the trend. This preserves affine
+   baselines on irregular grids and reduces isolated positive/negative spikes.
+   Boundary neighborhoods without full support retain their original values.
+   The measured spectrum itself is never smoothed or replaced.
+3. Lay out overlapping windows of full width W with centers W/4 apart, measured
+   from the low-wavenumber endpoint. Use only centers inside the measured range.
+   Within each window, compute the lower convex hull of the estimation signal
+   and interpolate its vertices. A lower convex hull is the line a taut
+   rubber band would take underneath those points: it bridges raised structures
+   but can still follow sloping backgrounds.
+4. Blend the overlapping hull estimates with triangular weights, largest at
+   each window center and zero at its support edges. This avoids abrupt seams
+   from disjoint bins. Coordinate-based windows handle nonuniform grids
+   directly. Empty gaps do not allocate windows across the entire empty range.
+   This smooth-looking estimate is an internal ranking guide only, never the
+   final baseline.
+5. Divide the measured range into candidate-selection intervals W/2 wide.
+   In each occupied interval, choose the actual measured sample whose Y is
+   closest to the lower support estimate (minimum `measured_y - envelope_y`).
+   Exclude interior samples whose deviation from the median signal exceeds
+   `tau = max(3*sigma, 0.003*signal_range, numerical_floor)`, avoiding isolated
+   spikes. Both measured endpoints are included even if spike-like; inspect
+   boundary warnings. No synthetic X or Y coordinates are introduced.
+6. Simplify that sequence of measured candidates using vertical-error splitting
+   with tolerance tau. Then insert additional eligible measured samples at
+   missed valleys wherever a straight segment rises above the estimation signal
+   by more than tau. Insertion terminates because each split retains a distinct
+   original sample. This allows important valleys to survive even if their
+   spacing is less than W/2. If an interval has no eligible interior samples,
+   do not invent an anchor. At C=0, start from all measured samples and remove
+   only numerically collinear points, deliberately following essentially all
+   signal including noise.
+7. Copy exact anchor X,Y coordinates from the original arrays (not from the
+   normalized coordinates or filtered signal). Use `linear_baseline` to join
+   those points with straight segments and subtract from the original Y.
+   Corrected values are zero at anchors to floating-point precision; negative
+   residuals between them are retained. The noise/shape tolerance now controls
+   simplification of the measured candidate chain, not fidelity to the envelope.
+   It does not impose a strict global envelope-fit error bound.
+
+Each weighted estimate can depend on samples up to W away, so the first/last W
+cm^-1 are conservatively marked as boundary-influenced (not just W/2).
+Warnings also flag large gaps, dense refinement, sharp features changed by the
+prefilter, and sustained negative corrected runs beyond the estimated noise.
+Invalid inputs and nonfinite arithmetic raise explicit errors.
+
+### Why not implement the original flat opening unchanged?
+
+Initial numerical trials showed that a flat opening produces excessive
+flattening as the window grows across the steep low-wavenumber background.
+Sloped local hull segments gave substantially better agreement with the manual
+coarse drawings while preserving exact affine baselines in synthetic tests.
+There are no spectrum-specific anchor positions in the method.
+
+### Review outputs and reproduction
+
+Run from the repository root:
+
+```powershell
+python baseline_review.py
+```
+
+Optional `--examples` and `--output` arguments select other reference/output
+folders. The script expects matching originals and one baseline/corrected pair,
+with both anchor exports, in each fine/coarse folder. Inconsistent grids, offsets,
+or anchors fail explicitly. The current review regions must be covered.
+
+Outputs in [`Automated_Results/`](Automated_Results/):
+
+- [`review_overview.png`](Automated_Results/review_overview.png): all five
+  spectra, comparing C=45/55/65 against both manual references at 1200-1900 cm^-1.
+- [`parameter_extremes.png`](Automated_Results/parameter_extremes.png): C=0/100,
+  showing deliberate over-removal and excessive broad residual structure.
+- One four-panel image per spectrum: baseline and corrected full-range views,
+  plus 1200-1900 cm^-1 detail. All values are unshifted. Circles mark the
+  actual measured anchors; each automatic legend reports anchor count `n`.
+- [`review_anchors.csv`](Automated_Results/review_anchors.csv): exact measured
+  coordinates, in ascending X order, for each displayed C=45/55/65 curve.
+- [`parameter_sweep.png`](Automated_Results/parameter_sweep.png): baseline
+  distances to manual references for every integer C=0..100.
+- [`metrics.csv`](Automated_Results/metrics.csv): all 505 runs, with whole-range
+  and 1300-1650 cm^-1 RMSE, maximum baseline errors, anchor counts, corrected
+  ranges/RMS, negative fractions, signed band areas, 1700-1900 cm^-1 peak
+  heights, boundary fractions, and warnings. The review script rejects off-data
+  anchors or baselines that are not exactly their `linear_baseline` polyline;
+  `anchor_sample_max_error` must be zero for every run.
+- [`run_metadata.json`](Automated_Results/run_metadata.json): settings, version,
+  reference statistics, closest-reference levels, selected results, and SHA-256
+  hashes for all 50 supplied CSV files.
+
+Distances to manual drawings describe similarity, not physical accuracy. Band
+areas use ascending wavenumber integration without clipping negative residuals.
+No claim of a scientifically validated default is made; C=45/55/65 are shared
+comparison settings chosen to show a useful spread across all five spectra.
+
+### Measured similarity to the expanded manual references
+
+The full integer sweep produced the following closest **whole-spectrum**
+matches. RMSE is in unshifted absorbance units:
+
+| Spectrum | Closest fine C | Fine RMSE | Closest coarse C | Coarse RMSE |
+|---|---:|---:|---:|---:|
+| SID180c, AutoGain, 256 scans | 50 | 0.002792 | 56 | 0.006661 |
+| SID181c, AutoGain, 256 scans | 59 | 0.008193 | 68 | 0.002560 |
+| SID181c, Gain1 | 59 | 0.006860 | 63 | 0.001518 |
+| SID181c, Gain4 | 46 | 0.005657 | 68 | 0.005584 |
+| SID181c, Gain8 | 59 | 0.009018 | 67 | 0.009351 |
+
+For all five spectra, the closest coarse setting exceeds the closest fine
+setting, supporting the intended direction of the control. These are not
+recommended settings: minimizing global error can trade away a locally
+important band. Use the regional metrics and plots as well.
+
+At the displayed C=45/55/65 levels the revised method uses 46-61, 24-35,
+and 16-28 measured anchors, respectively. All 505 sweep runs pass exact
+sample-membership and anchor-polyline reconstruction checks. The coordinate
+export contains 547 measured anchor pairs across the 15 displayed candidates.
+
+At C=0, corrected RMS is below 0.002 for all five inputs: virtually all signal
+has been removed. At C=100, corrected RMS exceeds twice its C=55 value for
+every input, and the extreme plots show large false-looking broad residuals.
+Thus, both deliberately poor endpoints are available rather than artificially
+clamping the method between the manual references.
+
+### Limitations and review priorities
+
+- One global scale cannot encode all of a human's region-specific choices.
+  In particular, following the raised 1300-1650 cm^-1 structure can also remove
+  part of the 1700-1900 cm^-1 band that both manual drawings preserve. Inspect
+  that tradeoff in the detail panels, not just overall RMSE.
+- Broad absorption and unwanted continuum remain indistinguishable by shape.
+  Neither the manual examples nor synthetic tests establish physical truth.
+- Window placement, discrete sampling, and simplification introduce small
+  fluctuations as C changes. Larger C generally bridges more, but pointwise
+  nesting and monotonically decreasing anchor counts are not guaranteed.
+- Convex background troughs are followed more readily than concave background
+  arches. Large C can falsely retain background curvature as broad absorption;
+  that deliberately bad behavior is visible in the extreme plots.
+- Endpoint peaks can be absorbed into the baseline because nothing outside the
+  measured range constrains them. The boundary mask is a warning, not a repair.
+- Median filtering reduces isolated spikes, but clusters or broad negative
+  artifacts can still pull the lower envelope down. Original spikes remain in
+  corrected data; no spike deletion or clipping is performed.
+- Exact sample membership, straight segments between every pair of anchors,
+  plotted marker coordinates, rejection of off-data review results,
+  affine recovery, output shape/subtraction, direction and offset invariance,
+  sampling-density behavior, local hulls against brute-force chords, noise,
+  isolated spikes, gaps, boundaries, parameter validation, all five references,
+  and reference consistency have automated numerical tests.
+
+The next decision should come from reviewing the candidate plots and identifying
+which broad structures should remain. This prototype does not add GUI controls,
+fit spectrum-specific exceptions, or silently optimize all corrected signal away.

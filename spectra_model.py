@@ -130,11 +130,15 @@ class SpectraSession:
         self.active = spectrum
         self.anchors.clear()
 
-    def resolve_anchor(self, x: float, y: float, free: bool = False) -> tuple[float, float]:
+    def resolve_anchor(
+        self, x: float, y: float, free: bool = False, *, replacing_index: int | None = None
+    ) -> tuple[float, float]:
         """Validate and resolve cursor coordinates without changing committed anchors."""
         spectrum = self.active
         if spectrum is None:
             raise ValueError("Open and activate a spectrum first.")
+        if replacing_index is not None and not 0 <= replacing_index < len(self.anchors):
+            raise ValueError("The baseline point no longer exists.")
         if not np.isfinite(x) or not np.isfinite(y):
             raise ValueError("Baseline coordinates must be finite.")
         if not float(np.min(spectrum.x)) <= x <= float(np.max(spectrum.x)):
@@ -144,13 +148,22 @@ class SpectraSession:
         else:
             index = spectrum.nearest_index(x)
             point = (float(spectrum.x[index]), float(spectrum.y[index]))
-        if any(existing[0] == point[0] for existing in self.anchors):
-            raise ValueError("A baseline point already exists at this X coordinate. Undo it first.")
+        if any(
+            existing[0] == point[0] and index != replacing_index
+            for index, existing in enumerate(self.anchors)
+        ):
+            raise ValueError("A baseline point already exists at this X coordinate. Move or delete it first.")
         return point
 
     def add_anchor(self, x: float, y: float, free: bool = False) -> tuple[float, float]:
         point = self.resolve_anchor(x, y, free)
         self.anchors.append(point)
+        return point
+
+    def move_anchor(self, index: int, x: float, y: float) -> tuple[float, float]:
+        """Snap an existing point to the spectrum without changing creation order."""
+        point = self.resolve_anchor(x, y, replacing_index=index)
+        self.anchors[index] = point
         return point
 
     def apply(self, retain_baseline: bool = True) -> Spectrum:
@@ -193,3 +206,17 @@ def save_spectrum(spectrum: Spectrum, path: Path, with_offset: bool) -> None:
         writer = csv.writer(stream)
         writer.writerow(["Wavenumbers [1/cm]", spectrum.name])
         writer.writerows(zip(spectrum.x, values))
+
+
+def save_anchors(spectrum: Spectrum, path: Path) -> None:
+    """Save exact correction anchors in creation order, without display offsets."""
+    if not spectrum.anchors:
+        raise ValueError("This spectrum has no saved correction anchors.")
+    parent_name = spectrum.parent.name if spectrum.parent is not None else spectrum.name
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow([
+            "Wavenumbers [1/cm]",
+            f"Baseline anchor absorbance (unshifted; parent: {parent_name})",
+        ])
+        writer.writerows(spectrum.anchors)

@@ -16,7 +16,9 @@ from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
-from spectra_model import Spectrum, SpectraSession, linear_baseline, load_spectrum, save_spectrum
+from spectra_model import (
+    Spectrum, SpectraSession, linear_baseline, load_spectrum, save_anchors, save_spectrum,
+)
 
 
 PALETTES: dict[str, tuple[str, ...]] = {
@@ -113,6 +115,7 @@ class BaselineApp:
         self.palette_popup: tk.Toplevel | None = None
         self.drag_free: bool | None = None
         self.drag_point: tuple[float, float] | None = None
+        self.drag_anchor_index: int | None = None
         self.master = tk.BooleanVar(value=False)
         self.offset = tk.StringVar(value="0.0000")
         self.status = tk.StringVar(value="Open a CSV spectrum to begin.")
@@ -195,8 +198,11 @@ class BaselineApp:
             text="Enable 'Add baseline points' in toolbar.\n"
                  "Left drag: snap to active spectrum\n"
                  "Shift + left drag: use cursor X,Y\n"
+                 "Hover an anchor: highlight it\n"
+                 "Drag an anchor: move along spectrum\n"
+                 "Right click an anchor: delete that point\n"
                  "Release: place the previewed point\n"
-                 "Right click: undo last point\n\n"
+                 "Right click elsewhere: undo last point\n\n"
                  "Checked = visible and selected for operations.\n"
                  "Highlighted = active for baseline and offset.\n"
                  "Use Show anchor points to display saved correction points.\n"
@@ -219,7 +225,8 @@ class BaselineApp:
         self.add_points_button.pack(side=tk.LEFT, padx=5)
         ToolTip(
             self.add_points_button,
-            "Add baseline points: drag to place anchors; hold Shift for free X,Y.",
+            "Drag to add anchors; Shift for free X,Y. Hover an anchor to highlight; "
+            "drag to move, right-click to delete.",
         )
         self.apply_button = ttk.Button(self.toolbar, text="Apply baseline", command=self.apply)
         self.apply_button.pack(side=tk.LEFT, padx=2)
@@ -274,6 +281,7 @@ class BaselineApp:
         )
         self.canvas.mpl_connect("button_press_event", self.plot_click)
         self.canvas.mpl_connect("motion_notify_event", self.plot_motion)
+        self.canvas.mpl_connect("figure_leave_event", self._plot_leave)
         self.canvas.mpl_connect("button_release_event", self.plot_release)
         self.canvas.mpl_connect("draw_event", self._cache_blit_background)
         for artist in (
@@ -500,9 +508,13 @@ class BaselineApp:
 
     def _draw_baseline(self) -> None:
         active = self.session.active
-        points = sorted(
-            self.session.anchors + ([self.drag_point] if self.drag_point is not None else [])
-        )
+        points = self.session.anchors.copy()
+        if self.drag_point is not None:
+            if self.drag_anchor_index is None:
+                points.append(self.drag_point)
+            else:
+                points[self.drag_anchor_index] = self.drag_point
+        points.sort()
         visible = bool(points) and active is not None and active.visible
         self.baseline_line.set_visible(visible)
         self.extension_line.set_visible(visible and len(points) >= 2)
@@ -677,7 +689,8 @@ class BaselineApp:
                 self.toolbar.zoom()
             self.status.set(
                 "Baseline point controls enabled. Drag to preview; release to place. "
-                "Hold Shift when starting a drag for cursor X,Y; right click to undo."
+                "Shift starts a free point. Hover an anchor to move/delete; "
+                "right click elsewhere to undo."
             )
         else:
             self.status.set("Baseline point controls disabled. Existing points are preserved.")
@@ -685,6 +698,7 @@ class BaselineApp:
     def _cancel_drag(self, redraw: bool = True) -> None:
         self.drag_free = None
         self.drag_point = None
+        self.drag_anchor_index = None
         self.cursor_line.set_visible(False)
         self.cursor_point.set_visible(False)
         if redraw:
@@ -697,14 +711,40 @@ class BaselineApp:
             self._cancel_drag()
             self.status.set("Point placement cancelled: release inside the plot to place it.")
 
+    def _anchor_at(self, event: MouseEvent) -> int | None:
+        active = self.session.active
+        if (
+            active is None or not active.visible or not self.session.anchors
+            or event.inaxes is not self.axes
+        ):
+            return None
+        positions = [
+            (x, y + active.display_offset_at(x)) for x, y in self.session.anchors
+        ]
+        pixels = self.axes.transData.transform(positions)
+        distances = np.hypot(pixels[:, 0] - event.x, pixels[:, 1] - event.y)
+        index = int(np.argmin(distances))
+        return index if distances[index] <= 8 * self.figure.dpi / 72 else None
+
+    def _plot_leave(self, event: object) -> None:
+        if self.drag_free is None:
+            self.cursor_point.set_visible(False)
+            self._blit_interactive()
+
     def plot_click(self, event: MouseEvent) -> None:
         if not self.add_points.get() or event.inaxes is not self.axes or self.toolbar.mode:
             return
+        anchor_index = self._anchor_at(event)
         if event.button == MouseButton.RIGHT:
             self._cancel_drag()
             if self.session.anchors:
-                self.session.anchors.pop()
-                self.status.set(f"Undid last point. {len(self.session.anchors)} point(s) remain.")
+                if anchor_index is None:
+                    self.session.anchors.pop()
+                    action = "Undid last point."
+                else:
+                    self.session.anchors.pop(anchor_index)
+                    action = "Deleted hovered point."
+                self.status.set(f"{action} {len(self.session.anchors)} point(s) remain.")
                 self._refresh()
             return
         if event.button != MouseButton.LEFT or event.xdata is None or event.ydata is None:
@@ -713,10 +753,23 @@ class BaselineApp:
         if active is None or not active.visible:
             self.status.set("Show and activate a spectrum before drawing a baseline.")
             return
-        self.drag_free = self.shift_held or "shift" in event.modifiers or (
-            event.key is not None and "shift" in event.key.lower()
+        self.drag_anchor_index = anchor_index
+        self.drag_free = anchor_index is None and (
+            self.shift_held or "shift" in event.modifiers or (
+                event.key is not None and "shift" in event.key.lower()
+            )
         )
-        self._update_drag(event)
+        if anchor_index is None:
+            self._update_drag(event)
+        else:
+            self.drag_point = self.session.anchors[anchor_index]
+            self.cursor_point.set_data(
+                [self.drag_point[0]],
+                [self.drag_point[1] + active.display_offset_at(self.drag_point[0])],
+            )
+            self.cursor_point.set_visible(True)
+            self.status.set("Drag this anchor along the spectrum; release to move; Esc to cancel.")
+            self._blit_interactive()
 
     def _update_drag(self, event: MouseEvent) -> None:
         self.drag_point = None
@@ -729,7 +782,8 @@ class BaselineApp:
             self.cursor_line.set_visible(self.drag_free is False)
             try:
                 self.drag_point = self.session.resolve_anchor(
-                    event.xdata, event.ydata, free=bool(self.drag_free)
+                    event.xdata, event.ydata, free=bool(self.drag_free),
+                    replacing_index=self.drag_anchor_index,
                 )
             except ValueError as error:
                 self.status.set(str(error))
@@ -749,6 +803,15 @@ class BaselineApp:
 
     def plot_motion(self, event: MouseEvent) -> None:
         if self.drag_free is None:
+            self.cursor_point.set_visible(False)
+            if self.add_points.get() and not self.toolbar.mode:
+                index = self._anchor_at(event)
+                active = self.session.active
+                if index is not None and active is not None:
+                    x, y = self.session.anchors[index]
+                    self.cursor_point.set_data([x], [y + active.display_offset_at(x)])
+                    self.cursor_point.set_visible(True)
+            self._blit_interactive()
             return
         if not self.add_points.get() or self.toolbar.mode:
             self._cancel_drag()
@@ -759,6 +822,8 @@ class BaselineApp:
         if self.drag_free is None or event.button != MouseButton.LEFT:
             return
         free = self.drag_free
+        anchor_index = self.drag_anchor_index
+        point = self.drag_point
         self._cancel_drag(redraw=False)
         if (
             not self.add_points.get() or self.toolbar.mode or event.inaxes is not self.axes
@@ -769,7 +834,15 @@ class BaselineApp:
             self._blit_interactive()
             return
         try:
-            x, y = self.session.add_anchor(event.xdata, event.ydata, free=free)
+            if anchor_index is None:
+                x, y = self.session.add_anchor(event.xdata, event.ydata, free=free)
+            elif (
+                point == self.session.anchors[anchor_index]
+                and self._anchor_at(event) == anchor_index
+            ):
+                x, y = self.session.anchors[anchor_index]
+            else:
+                x, y = self.session.move_anchor(anchor_index, event.xdata, event.ydata)
         except ValueError as error:
             self.status.set(str(error))
             self.root.bell()
@@ -782,7 +855,7 @@ class BaselineApp:
         display_y = y + active.display_offset_at(x)
         self.status.set(
             f"{len(self.session.anchors)} point(s): X={x:.6g}, Y={display_y:.6g}. "
-            "Right click to undo; Apply subtracts the full-range piecewise-linear baseline."
+            "Right click an anchor to delete, elsewhere to undo; Apply subtracts the baseline."
         )
         self._refresh()
 
@@ -960,10 +1033,19 @@ class BaselineApp:
         dialog.resizable(False, False)
         dialog.transient(self.root)
         ttk.Label(dialog, text="Save checked spectra as two-column CSV files.", padding=15).pack()
+        include_anchors = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            dialog, text="Also save explicit anchor coordinates (*_Anchors.csv)",
+            variable=include_anchors,
+        ).pack(anchor=tk.W, padx=15, pady=4)
+        ttk.Label(
+            dialog, text="Anchors use unshifted parent absorbance, in creation order.",
+        ).pack(padx=15, pady=(0, 4))
 
         def choose(with_offset: bool) -> None:
+            anchors = include_anchors.get()
             dialog.destroy()
-            self._export_spectra(selected, with_offset)
+            self._export_spectra(selected, with_offset, include_anchors=anchors)
 
         ttk.Button(dialog, text="Save with offset", command=lambda: choose(True)).pack(
             fill=tk.X, padx=15, pady=4
@@ -987,7 +1069,9 @@ class BaselineApp:
             name = "_" + name
         return name[:160]
 
-    def _export_spectra(self, selected: list[Spectrum], with_offset: bool) -> None:
+    def _export_spectra(
+        self, selected: list[Spectrum], with_offset: bool, *, include_anchors: bool = False
+    ) -> None:
         targets: list[tuple[Spectrum, Path]] = []
         if len(selected) == 1:
             filename = filedialog.asksaveasfilename(
@@ -1007,30 +1091,52 @@ class BaselineApp:
                 stem = self._safe_filename(spectrum.name)
                 name = stem + ".csv"
                 index = 2
-                while name.casefold() in used:
+                while (
+                    name.casefold() in used
+                    or (
+                        include_anchors and spectrum.anchors
+                        and (Path(name).stem + "_Anchors.csv").casefold() in used
+                    )
+                ):
                     name = f"{stem}_{index}.csv"
                     index += 1
                 used.add(name.casefold())
+                if include_anchors and spectrum.anchors:
+                    used.add((Path(name).stem + "_Anchors.csv").casefold())
                 targets.append((spectrum, Path(directory) / name))
-            existing = [path.name for _, path in targets if path.exists()]
-            if existing and not messagebox.askokcancel(
-                "Overwrite existing files?",
-                "These files already exist:\n" + "\n".join(existing) + "\n\nOverwrite them?",
-                parent=self.root,
-            ):
-                return
+        anchor_targets = [
+            (spectrum, path.with_name(path.stem + "_Anchors.csv"))
+            for spectrum, path in targets if include_anchors and spectrum.anchors
+        ]
+        existing = [
+            path.name for _, path in (
+                targets + anchor_targets if len(selected) > 1 else anchor_targets
+            ) if path.exists()
+        ]
+        if existing and not messagebox.askokcancel(
+            "Overwrite existing files?",
+            "These files already exist:\n" + "\n".join(existing) + "\n\nOverwrite them?",
+            parent=self.root,
+        ):
+            return
         saved = 0
+        total = len(targets) + len(anchor_targets)
         try:
             for spectrum, path in targets:
                 save_spectrum(spectrum, path, with_offset)
                 saved += 1
+            for spectrum, path in anchor_targets:
+                save_anchors(spectrum, path)
+                saved += 1
         except (OSError, ValueError) as error:
             messagebox.showerror(
-                "Export failed", f"Saved {saved} of {len(targets)} file(s).\n\n{error}", parent=self.root
+                "Export failed", f"Saved {saved} of {total} file(s).\n\n{error}", parent=self.root
             )
             return
         self.status.set(
-            f"Saved {saved} spectrum/spectra {'with' if with_offset else 'without cumulative'} offset."
+            f"Saved {len(targets)} spectrum/spectra "
+            f"{'with' if with_offset else 'without cumulative'} offset"
+            f" and {len(anchor_targets)} unshifted anchor file(s)."
         )
 
     def save_image(self) -> None:
